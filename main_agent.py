@@ -9,9 +9,38 @@ from modules.llm_services import (
     summarize_and_extract_insights,
     generate_comparison_table,
     ontology_for,
-    verify_official_site
+    verify_official_site,
+    synthesize_brand_analysis
 )
-from modules.shopping_scraper import scrape_ssg_playwright
+from modules.shopping_scraper import scrape_ssg, analyze_by_brand
+
+def get_shopping_data(brand_profile: dict, progress) -> dict:
+    products_to_search = brand_profile.get("products_services", [])
+    if not products_to_search: return {}
+    
+    main_product = products_to_search[0]
+    # LLM이 생성한 제품명에서 검색에 방해가 되는 괄호 등을 제거
+    search_query = re.sub(r'\(.*\)', '', main_product).strip()
+    
+    progress("shopping_agent:start", {"target": "SSG.COM", "product": search_query})
+    
+    # 검색 URL 동적 생성
+    encoded_query = re.sub(r'\s+', '+', search_query)
+    url = f"https://www.ssg.com/search.ssg?target=all&query={encoded_query}&sort=sale"
+    
+    # 업그레이드된 스크레이퍼 호출
+    items = asyncio.run(scrape_ssg(url, max_items=80, progress=progress))
+    
+    # 수집된 데이터로 브랜드별 분석 수행
+    brand_analysis = analyze_by_brand(items)
+    
+    progress("shopping_agent:done", {"found_items": len(items), "brand_counts": len(brand_analysis.get("brand_counts", {}))})
+    
+    return {
+        "search_query": search_query,
+        "brand_analysis": brand_analysis,
+        "top_results": items
+    }
 
 def fetch_evidence(meta: dict) -> dict:
     try:
@@ -20,6 +49,84 @@ def fetch_evidence(meta: dict) -> dict:
         return {**meta, "content": _clean(text)}
     except Exception as e:
         return {**meta, "content": "", "error": str(e)}
+
+def enrich_profile_with_shopping(profile: dict, progress) -> dict:
+    """
+    프로필 생성 직후 호출해서:
+    - SSG 상위 N개 결과를 긁어오고
+    - profile['shopping_snapshot'] 에 저장
+    - price가 일부라도 있으면 profile['estimated_price_range'] 보강
+    - report['shopping_data']에 들어갈 dict을 반환
+    """
+    # 검색어 우선순위: products_services[0] -> profile['brand'] -> '헤어드라이어' 같은 키워드(없으면 브랜드로)
+    products = profile.get("products_services") or []
+    query = (products[0] if products else None) or profile.get("brand") or ""
+    if not query:
+        return {"main_product_analysis": {"product_name": "", "top_10_results": []}}
+
+    progress("shopping_agent:start", {"target": "SSG.COM", "product": query})
+
+    # Playwright 기반 스크래퍼 호출 (동기 컨텍스트이므로 asyncio.run 사용)
+    results = asyncio.run(scrape_ssg_playwright(query=query, top_n=10))
+
+    # 프로필에 스냅샷 부착
+    profile["shopping_snapshot"] = results
+
+    # 가격이 일부라도 있으면 가격대 보강 (None은 제외)
+    prices = [p for p in (r.get("price") for r in results) if isinstance(p, (int, float))]
+    prices = [p for p in prices if 10_000 < p < 10_000_000]
+    if prices:
+        lo, hi = min(prices), max(prices)
+        profile["estimated_price_range"] = f"약 {lo:,}원 ~ {hi:,}원"
+
+    progress("shopping_agent:done", {"product": query, "results_count": len(results)})
+
+    return {
+        "main_product_analysis": {
+            "product_name": query,
+            "top_10_results": results
+        }
+    }
+
+def create_competitor_profile(name: str, industry: str, audience: str, per_query_cap: int, preferred_provider: str, min_keep_threshold: int, progress) -> dict:
+    progress("competitor:start", {"name": name})
+    
+    # --- 1. 모든 소스에서 원본 데이터 수집 ---
+    site_profile = {}; market_awareness_data = {}; consumer_image = "정보 없음"
+    
+    seed_url = discover_seed_url(name, industry, per_query_cap, preferred_provider, progress)
+    if seed_url:
+        pages = crawl_site(seed_url, industry, max_pages=10, progress=progress)
+        if pages:
+            site_profile = brand_profile_from_pages(name, pages, industry, audience)
+            site_profile['estimated_price_range'] = analyze_price_range(pages)
+    
+    market_awareness_data = get_market_awareness(name, industry, audience, per_query_cap, preferred_provider, min_keep_threshold, progress)
+    consumer_image = get_consumer_image(name, industry, audience, per_query_cap, progress)
+    
+    # --- 2. '종합 분석가' LLM 호출하여 최종 분석 프로필 생성 ---
+    final_analysis = synthesize_brand_analysis(
+        brand_name=name,
+        site_profile=site_profile,
+        market_awareness=market_awareness_data,
+        consumer_image=consumer_image
+    )
+
+    # --- 3. 최종 결과 정리: 분석 결과 + 원본 데이터를 합쳐서 반환 ---
+    final_profile = {
+        "brand": name,
+        # '종합 분석가'가 생성한 깊이 있는 분석 결과
+        "소비자 관점": final_analysis.get("consumer_perspective", "분석 실패"),
+        "시장 인식": final_analysis.get("market_perception", "분석 실패"),
+        "광고 메시지 & 키메시지 현황": final_analysis.get("ad_key_messages", "분석 실패"),
+        # 테이블 생성을 위한 원본 데이터
+        "price_range": site_profile.get("estimated_price_range", "정보 없음"),
+        "key_products": site_profile.get("products_services", ["-"]),
+    }
+
+    progress("competitor:done", {"name": name})
+    return final_profile
+    
 
 def analyze_price_range(pages: list) -> str:
     all_prices = [p for page in pages for p in page.get("prices", [])]
@@ -91,9 +198,22 @@ def discover_seed_url(brand_name: str, industry: str, per_query_cap: int, prefer
 
 def get_market_awareness(brand_name: str, industry: str, audience: str, per_query_cap: int, preferred_provider: str, min_keep_threshold: int, progress) -> dict:
     progress("news_agent:start", {"brand": brand_name})
-    queries = [f'"{brand_name}" 시장 점유율 최신 뉴스', f'"{brand_name}" {industry} 산업 동향 네이버 뉴스', f'"{brand_name}" {audience} 타겟 분석 기사']
-    metas = provider_collect(preferred_provider, qs=queries, per_query_cap=per_query_cap, min_keep_threshold=min_keep_threshold, timelimit='y', progress=progress)
-    if not metas: return {"error": "No relevant news found.", "insights":[]}
+    
+    # ===== 변경점: 검색어를 네이버/다음 뉴스로만 한정 =====
+    base_keywords = [
+        f'"{brand_name}"', 
+        f'"{brand_name}" {industry} 동향',
+        f'"{brand_name}" {audience} 반응'
+    ]
+    target_sites = ["site:news.naver.com", "site:v.daum.net"]
+    queries = [f"{site} {keyword}" for site in target_sites for keyword in base_keywords]
+    
+    # 국내 뉴스 포털 검색은 DDG가 더 안정적일 수 있으므로 'ddg'를 우선 사용
+    metas = provider_collect('ddg', qs=queries, per_query_cap=per_query_cap, min_keep_threshold=min_keep_threshold, timelimit='y', progress=progress)
+
+    if not metas:
+        return {"error": "No relevant news found.", "insights":[]}
+        
     docs = [fetch_evidence(m) for m in metas]
     return summarize_and_extract_insights(docs, f"{brand_name}의 시장 인지도", industry, audience)
 
@@ -203,7 +323,10 @@ def create_competitor_profile(name: str, industry: str, audience: str, per_query
 
 
 def run_research_v3(seed_url: str, industry: str, audience: str, keywords: list, competitor_list: list, per_query_cap: int, preferred_provider: str, min_keep_threshold: int, progress):
-    report = {"brand_profile": {}, "ontology": {}, "news_analysis": {}, "raw_news_docs": [], "shopping_data": {}, "competitor_profiles": [], "competitor_comparison_table": "분석 중 오류 발생", "run_meta": {}}
+    report = {
+        "brand_profile": {}, "ontology": {}, "news_analysis": {}, "raw_news_docs": [], "shopping_data": {},
+        "competitor_profiles": [], "competitor_comparison_table": "분석 중 오류 발생", "run_meta": {}
+    }
     try:
         progress("stage:start", {"seed_url": seed_url, "industry": industry, "audience": audience})
         if not seed_url:
@@ -220,6 +343,14 @@ def run_research_v3(seed_url: str, industry: str, audience: str, keywords: list,
             profile = brand_profile_from_pages(brand_hint, pages, industry, audience)
             profile['estimated_price_range'] = analyze_price_range(pages)
             report["brand_profile"] = profile
+
+            try:
+                shopping_data = enrich_profile_with_shopping(profile, progress)
+                report["shopping_data"] = shopping_data
+            except Exception as shop_e:
+                progress("shopping:error", {"stage": "enrich_profile", "error": str(shop_e)})
+
+            
             product_industry = (profile.get("products_services") or ["-"])[0]
             report["ontology"] = ontology_for(industry, audience, product_industry)
             progress("profile:done", {"brand": profile.get('brand')})
@@ -227,64 +358,61 @@ def run_research_v3(seed_url: str, industry: str, audience: str, keywords: list,
             progress("profile:error", {"error": str(e)}); report["brand_profile"] = {"error": f"프로필 생성 실패: {e}"}
 
         brand_name = report["brand_profile"].get("brand", brand_hint)
+        
+        # --- 뉴스 분석 (자사) ---
         try:
-            news_analysis = get_market_awareness(brand_name, industry, audience, per_query_cap, preferred_provider, min_keep_threshold, progress)
-            report["news_analysis"] = news_analysis
-            # report["raw_news_docs"]는 news_analysis 내부에서 처리되지 않으므로 별도 수집 필요
+            base_keywords = [
+                f'"{brand_name}"',
+                f'"{brand_name}" 신제품',
+                f'"{brand_name}" 캠페인 OR 광고'
+            ]
+            target_sites = ["site:news.naver.com", "site:v.daum.net"]
+            news_queries = [f"{site} {keyword}" for site in target_sites for keyword in base_keywords]
+    
+            # provider_collect를 호출하지만, 내부적으로 DDG를 우선 사용하도록 'ddg'를 전달
+            news_metas = provider_collect('ddg', qs=news_queries, per_query_cap=per_query_cap, min_keep_threshold=min_keep_threshold, timelimit='y', progress=progress)
+            
+            raw_news_docs = [fetch_evidence(m) for m in news_metas]
+            report["raw_news_docs"] = raw_news_docs
+            report["news_analysis"] = summarize_and_extract_insights(raw_news_docs, f"{brand_name} 뉴스 분석", industry, audience)
         except Exception as e:
-            progress("news:error", {"error": str(e)}); report["news_analysis"] = {"error": f"뉴스 분석 실패: {e}"}
+            progress("news:error", {"error": str(e)})
+            report["news_analysis"] = {"error": f"뉴스 분석 실패: {e}"}
+
+        # --- 쇼핑 데이터 분석 (자사) ---
         try:
             if report["brand_profile"].get("products_services"):
                 report["shopping_data"] = get_shopping_data(report["brand_profile"], progress)
         except Exception as e:
-            progress("shopping:error", {"error": str(e)}); report["shopping_data"] = {"error": f"쇼핑 데이터 분석 실패: {e}"}
-        # Competitor analysis with graceful degradation
+            progress("shopping:error", {"error": str(e)})
+
+        # --- 경쟁사 분석 ---
         try:
-            names = competitor_list if len(competitor_list ) > 3 else  report.get("ontology", {}).get("competitor_corporate_and_brand_name") 
-            if not names:
-                progress("competitor:skip", {"reason": "No competitor names available"})
-                report["competitor_profiles"] = []
-                report["competitor_comparison_table"] = "경쟁사 정보가 없어 비교표를 생성할 수 없습니다."
-            else:
-                progress("competitor:start_batch", {"count": len(names), "names": names})
-                competitor_profiles = []
-                
-                # Process each competitor individually with error handling
-                for i, name in enumerate(names):
-                    try:
-                        profile = create_competitor_profile(name, industry, audience, per_query_cap, preferred_provider, min_keep_threshold, progress)
-                        # Check if profile has meaningful data
-                        if profile and profile.get("brand") and profile.get("brand") != name:
-                            competitor_profiles.append(profile)
-                            progress("competitor:success", {"name": name, "completed": i+1, "total": len(names)})
-                        else:
-                            progress("competitor:empty", {"name": name, "reason": "insufficient_data"})
-                    except Exception as comp_e:
-                        progress("competitor:individual_error", {"name": name, "error": str(comp_e)})
-                        # Continue with other competitors even if one fails
-                        continue
-                
-    
-                
-                # Generate comparison table only if we have competitor data
-                if competitor_profiles:
-                    try:
-                        main_brand_profile_for_table = { "brand": brand_name, **report["brand_profile"] }
-                        main_brand_profile_for_table['market_awareness'] = report["news_analysis"].get("insights",[{}])[0].get("insight","")
-                        main_brand_profile_for_table['consumer_image'] = get_consumer_image(brand_name, industry, audience, per_query_cap, progress)
-                        report["competitor_comparison_table"] = generate_comparison_table(main_brand_profile_for_table, competitor_profiles, industry, audience)
-                        progress("competitor:comparison_done", {"competitor_count": len(competitor_profiles)})
-                    except Exception as table_e:
-                        progress("competitor:comparison_error", {"error": str(table_e)})
-                        report["competitor_comparison_table"] = f"비교표 생성 중 오류 발생: {str(table_e)}"
-                else:
-                    report["competitor_comparison_table"] = "경쟁사 데이터 수집에 실패하여 비교표를 생성할 수 없습니다."
-                    progress("competitor:no_data", {"attempted": len(names), "successful": 0})
-                    
+            names = report.get("ontology", {}).get("competitor_corporate_and_brand_name") or competitor_list or []
+            competitor_profiles = [create_competitor_profile(name, industry, audience, per_query_cap, preferred_provider, min_keep_threshold, progress) for name in names]
+            report["competitor_profiles"] = competitor_profiles
+            
+            # --- 비교표 생성을 위한 자사 최종 프로필 생성 ---
+            consumer_image = get_consumer_image(brand_name, industry, audience, per_query_cap, progress)
+            final_main_brand_analysis = synthesize_brand_analysis(
+                brand_name=brand_name,
+                site_profile=report["brand_profile"],
+                market_awareness=report["news_analysis"],
+                consumer_image=consumer_image
+            )
+            main_brand_profile_for_table = {
+                "brand": brand_name,
+                "소비자 관점": final_main_brand_analysis.get("consumer_perspective"),
+                "시장 인식": final_main_brand_analysis.get("market_perception"),
+                "광고 메시지 & 키메시지 현황": final_main_brand_analysis.get("ad_key_messages"),
+                "price_range": report["brand_profile"].get("estimated_price_range"),
+                "key_products": report["brand_profile"].get("products_services"),
+            }
+            
+            report["competitor_comparison_table"] = generate_comparison_table(main_brand_profile_for_table, competitor_profiles, industry, audience)
         except Exception as e:
-            progress("competitor:fatal_error", {"error": str(e)})
-            report["competitor_profiles"] = []
-            report["competitor_comparison_table"] = f"경쟁사 분석 중 오류 발생: {str(e)}"
+            progress("competitor:error", {"error": str(e)})
+
     except Exception as e:
         progress("pipeline:fatal_error", {"error": str(e)})
     finally:

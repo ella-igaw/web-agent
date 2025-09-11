@@ -238,3 +238,30 @@ def ontology_for(industry: str, audience: str, product_industry: str, on_k: int 
     if "error" in response: return {key: [] for key in keys}
     for key in keys: response.setdefault(key, [])
     return response
+
+def synthesize_brand_analysis(brand_name: str, site_profile: dict, market_awareness: dict, consumer_image: str) -> dict:
+    """
+    수집된 모든 데이터를 종합하여, 예시 리포트 수준의 최종 브랜드 분석을 생성합니다.
+    """
+    # market_awareness 딕셔너리에서 인사이트 텍스트만 추출
+    awareness_insights = "\n".join([f"- {item.get('insight', '')}" for item in market_awareness.get("insights", [])])
+
+    prompt = f"""
+역할: 당신은 대한민국 소비재 시장의 수석 애널리스트입니다. 수집된 모든 원본 데이터를 바탕으로, '{brand_name}' 브랜드에 대한 최종 분석 프로필을 작성해주세요. 각 항목은 전문가의 시각에서 분석된, 깊이 있고 정제된 내용이어야 합니다.
+
+[입력 데이터]
+1. 웹사이트 프로필: {site_profile}
+2. 시장 인지도 (뉴스 기반 요약): {awareness_insights}
+3. 소비자 이미지 (SNS 기반 요약): {consumer_image}
+
+[작업 지시]
+위 입력 데이터를 종합적으로 분석하여, 아래 JSON 형식에 맞춰 각 항목의 내용을 작성해주세요.
+
+[출력 JSON 형식]
+{{
+  "consumer_perspective": "웹사이트 프로필의 제품 정보와 소비자 이미지를 종합하여, 소비자들이 브랜드를 어떻게 인식하는지 상세히 분석. (장점, 단점, 핵심 구매 요인 등 포함)",
+  "market_perception": "시장 인지도(뉴스)와 웹사이트 프로필을 바탕으로, 시장 전체에서 이 브랜드가 어떤 위치를 차지하고 있는지 분석. (전문가용, 대중용, 혁신적, 가성비 등)",
+  "ad_key_messages": "웹사이트 프로필의 핵심 메시지와 소비자 이미지 등을 바탕으로, 현재 사용하고 있는 주요 광고/키 메시지를 2~3개 추출하여 요약."
+}}
+"""
+    return get_llm_response(prompt)

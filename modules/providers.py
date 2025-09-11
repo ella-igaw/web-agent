@@ -1,4 +1,3 @@
-# modules/providers.py
 import time, os
 from urllib.parse import urlparse
 from ddgs import DDGS
@@ -11,7 +10,7 @@ def ddg_collect(qs: list, per_query_cap: int, timelimit: str | None = None, prog
     items, seen = [], set()
     with DDGS() as ddgs:
         for q in qs:
-            q = _sanitize_query(q);
+            q = _sanitize_query(q)
             if not q: continue
             try:
                 progress("ddg:query", {"query": q})
@@ -26,21 +25,25 @@ def ddg_collect(qs: list, per_query_cap: int, timelimit: str | None = None, prog
     return items
 
 def tavily_collect(qs: list, per_query_cap: int, topic: str = "general", progress=lambda e,p:None) -> list:
-    #api_key = os.environ.get("TAVILY_API_KEY")
-    api_key = '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'
+    api_key = os.environ.get("TAVILY_API_KEY")
     if not api_key:
         progress("tavily:error", {"reason": "API key not found"}); return []
     try:
-        client = TavilyClient(api_key=api_key); all_results, seen_urls = [], set()
+        client = TavilyClient(api_key=api_key)
+        all_results, seen_urls = [], set()
         for q in qs:
-            q = _sanitize_query(q);
+            q = _sanitize_query(q)
             if not q: continue
             progress("tavily:query", {"query": q, "topic": topic})
-            response = client.search(query=q, search_depth="basic", topic=topic, max_results=per_query_cap, include_answer="advanced", time_range="year")
+            response = client.search(query=q, search_depth="advanced", topic=topic, max_results=per_query_cap)
             for res in response.get("results", []):
                 href = res.get("url")
                 if href and href not in seen_urls:
-                    seen_urls.add(href); all_results.append({"title": res.get("title",""), "url": href, "source": urlparse(href).netloc, "content": res.get("content", "")})
+                    seen_urls.add(href)
+                    all_results.append({
+                        "title": res.get("title",""), "url": href, 
+                        "source": urlparse(href).netloc, "content": res.get("content", "")
+                    })
         return all_results
     except Exception as e:
         progress("tavily:error", {"query": q, "error": str(e)}); return []
@@ -53,7 +56,7 @@ def provider_collect(preferred_provider: str, qs: list, per_query_cap: int, min_
         return primary
 
     primary_results = []
-    if preferred_provider == "tavily" and os.environ.get("TAVILY_API_KEY"):
+    if preferred_provider == "tavily" and os.environ.get("Tavily_API_KEY"):
         primary_results = tavily_collect(qs, per_query_cap, topic, progress)
         if len(primary_results) < min_keep_threshold:
             progress("provider:fallback", {"from": "tavily", "to": "ddg"})

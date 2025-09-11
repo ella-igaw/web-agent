@@ -59,24 +59,40 @@ if st.session_state.get('result_data'):
     st.header("📊 경쟁사 비교 분석")
     st.markdown(res.get("competitor_comparison_table", "생성된 비교표가 없습니다."))
 
-    st.header("🛒 SSG.COM 판매 순위 분석 (주요 제품)")
-    shopping_data_wrapper = res.get("shopping_data", {})
-    if "error" in shopping_data_wrapper:
-        st.info("쇼핑 데이터 분석 중 오류가 발생했습니다.")
-        with st.expander("오류 상세 내용 보기"):
-            st.error(shopping_data_wrapper.get("error"))
+    st.header("🛒 SSG.COM 판매 순위 분석")
+    shopping_data = res.get("shopping_data", {})
+    
+    if shopping_data and "error" not in shopping_data:
+        search_query = shopping_data.get('search_query')
+        brand_analysis = shopping_data.get('brand_analysis', {}).get('brand_counts', {})
+        top_results = shopping_data.get('top_results', [])
+    
+        st.subheader(f"'{search_query}' 검색 결과 분석")
+        
+        col1, col2 = st.columns([1, 2]) # 1:2 비율로 컬럼 나누기
+        
+        with col1:
+            st.markdown("**브랜드별 노출 순위**")
+            # 브랜드 분석 결과를 DataFrame으로 시각화
+            if brand_analysis:
+                brand_df = pd.DataFrame(list(brand_analysis.items()), columns=['Brand', 'Count'])
+                st.dataframe(brand_df, hide_index=True)
+            else:
+                st.info("브랜드 분석 데이터가 없습니다.")
+    
+        with col2:
+            st.markdown("**판매량순 상위 상품 목록**")
+            # 상위 상품 목록을 DataFrame으로 시각화
+            if top_results and "error" not in top_results[0]:
+                df = pd.DataFrame(top_results)
+                df['price'] = df['price'].apply(lambda x: f"{x:,}원" if isinstance(x, (int, float)) else x)
+                display_columns = ['rank', 'brand', 'title', 'price', 'review_count']
+                st.dataframe(df[display_columns], use_container_width=True, hide_index=True)
+            else:
+                st.warning("상위 상품 목록을 가져오지 못했습니다.")
     else:
-        shopping_analysis = shopping_data_wrapper.get("main_product_analysis", {})
-        results = shopping_analysis.get("top_10_results", [])
-        if results and isinstance(results, list) and (len(results) == 0 or "error" not in results[0]):
-            st.subheader(f"'{shopping_analysis.get('product_name')}' 판매순 TOP 10")
-            df = pd.DataFrame(results)
-            st.dataframe(df, use_container_width=True, hide_index=True)
-        else:
-            st.info("SSG.COM에서 유의미한 상품 순위 데이터를 수집하지 못했습니다.")
-            if results and isinstance(results, list) and len(results) > 0 and "error" in results[0]:
-                with st.expander("오류 상세 내용 보기"):
-                    st.warning(results[0].get("error"))
+        st.info("쇼핑 데이터를 수집하지 못했습니다.")
+
 
     st.header("🏢 브랜드 프로필 (자사)")
     st.json(res.get("brand_profile", {}))
